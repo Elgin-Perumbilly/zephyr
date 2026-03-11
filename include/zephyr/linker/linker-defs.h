@@ -131,11 +131,11 @@ extern char __kernel_ram_start[];
 extern char __kernel_ram_end[];
 extern char __kernel_ram_size[];
 
-/* Used by z_bss_zero or arch-specific implementation */
+/* Used by arch_bss_zero or arch-specific implementation */
 extern char __bss_start[];
 extern char __bss_end[];
 
-/* Used by z_data_copy() or arch-specific implementation */
+/* Used by arch_data_copy() or arch-specific implementation */
 #ifdef CONFIG_XIP
 extern char __data_region_load_start[];
 extern char __data_region_start[];
@@ -190,18 +190,6 @@ extern char __gcov_bss_size[];
 
 /* end address of image, used by newlib for the heap */
 extern char _end[];
-
-#if (DT_NODE_HAS_STATUS_OKAY(DT_CHOSEN(zephyr_ccm)))
-extern char __ccm_data_load_start[];
-extern char __ccm_start[];
-extern char __ccm_data_start[];
-extern char __ccm_data_end[];
-extern char __ccm_bss_start[];
-extern char __ccm_bss_end[];
-extern char __ccm_noinit_start[];
-extern char __ccm_noinit_end[];
-extern char __ccm_end[];
-#endif
 
 #if (DT_NODE_HAS_STATUS_OKAY(DT_CHOSEN(zephyr_itcm)))
 extern char __itcm_start[];

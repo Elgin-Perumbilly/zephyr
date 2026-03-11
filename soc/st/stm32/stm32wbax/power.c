@@ -7,6 +7,7 @@
 #include <zephyr/cache.h>
 #include <zephyr/pm/pm.h>
 #include <soc.h>
+#include <stm32_bitops.h>
 #include <zephyr/init.h>
 #include <zephyr/arch/common/pm_s2ram.h>
 #include <zephyr/drivers/timer/system_timer.h>
@@ -17,19 +18,25 @@
 
 #include <cmsis_core.h>
 
-#include <stm32wbaxx_ll_bus.h>
-#include <stm32wbaxx_ll_cortex.h>
-#include <stm32wbaxx_ll_pwr.h>
-#include <stm32wbaxx_ll_rcc.h>
-#include <stm32wbaxx_ll_system.h>
+#include <stm32_ll_bus.h>
+#include <stm32_ll_cortex.h>
+#include <stm32_ll_pwr.h>
+#include <stm32_ll_rcc.h>
+#include <stm32_ll_system.h>
 #include <clock_control/clock_stm32_ll_common.h>
 
 #include <zephyr/logging/log.h>
 
+#if defined(CONFIG_PM) && (defined(CONFIG_BT) || defined(CONFIG_IEEE802154))
+#include <zephyr/pm/policy.h>
+#include "os_wrapper.h"
+#include "ll_sys.h"
+#endif
+
 LOG_MODULE_DECLARE(soc, CONFIG_SOC_LOG_LEVEL);
 
 
-#define HSE_ON (READ_BIT(RCC->CR, RCC_CR_HSEON) == RCC_CR_HSEON)
+#define HSE_ON (stm32_reg_read_bits(&RCC->CR, RCC_CR_HSEON) == RCC_CR_HSEON)
 
 static uint32_t ram_waitstates_backup;
 static uint32_t flash_latency_backup;
@@ -161,9 +168,9 @@ static void set_mode_stop_enter(uint8_t substate_id)
 			while (__HAL_FLASH_GET_LATENCY() != FLASH_LATENCY_1) {
 			}
 		}
-		ram_waitstates_backup = READ_BIT(RAMCFG_SRAM1->CR, RAMCFG_CR_WSC);
-		MODIFY_REG(RAMCFG_SRAM1->CR, RAMCFG_CR_WSC, RAMCFG_WAITSTATE_1);
-		MODIFY_REG(RAMCFG_SRAM2->CR, RAMCFG_CR_WSC, RAMCFG_WAITSTATE_1);
+		ram_waitstates_backup = stm32_reg_read_bits(&RAMCFG_SRAM1->CR, RAMCFG_CR_WSC);
+		stm32_reg_modify_bits(&RAMCFG_SRAM1->CR, RAMCFG_CR_WSC, RAMCFG_WAITSTATE_1);
+		stm32_reg_modify_bits(&RAMCFG_SRAM2->CR, RAMCFG_CR_WSC, RAMCFG_WAITSTATE_1);
 	}
 	switch (substate_id) {
 	case 1:
@@ -191,8 +198,10 @@ static void set_mode_stop_exit(uint8_t substate_id)
 			__HAL_FLASH_SET_LATENCY(flash_latency_backup);
 			while (__HAL_FLASH_GET_LATENCY() != flash_latency_backup) {
 			}
-			MODIFY_REG(RAMCFG_SRAM1->CR, RAMCFG_CR_WSC, ram_waitstates_backup);
-			MODIFY_REG(RAMCFG_SRAM2->CR, RAMCFG_CR_WSC, ram_waitstates_backup);
+			stm32_reg_modify_bits(&RAMCFG_SRAM1->CR, RAMCFG_CR_WSC,
+					      ram_waitstates_backup);
+			stm32_reg_modify_bits(&RAMCFG_SRAM2->CR, RAMCFG_CR_WSC,
+					      ram_waitstates_backup);
 		}
 	}
 
@@ -235,6 +244,26 @@ void pm_state_exit_post_ops(enum pm_state state, uint8_t substate_id)
 	irq_unlock(0);
 }
 
+#ifdef CONFIG_PM_CUSTOM_TICKS_HOOK
+int64_t pm_policy_next_custom_ticks(void)
+{
+	int64_t ret;
+
+	if (LL_PWR_GetRadioMode() == LL_PWR_RADIO_ACTIVE_MODE) {
+		ret = 0; /* Radio is active - inhibit sleep */
+	} else {
+		uint64_t next_radio_evt_us = os_timer_get_earliest_time();
+
+		if (next_radio_evt_us == LL_DP_SLP_NO_WAKEUP) {
+			ret = -1LL; /* No radio event pending */
+		} else {
+			ret = k_us_to_ticks_floor64(next_radio_evt_us);
+		}
+	}
+	return ret;
+}
+#endif /* CONFIG_PM_CUSTOM_TICKS_HOOK */
+
 /* Initialize STM32 Power */
 void stm32_power_init(void)
 {
@@ -242,11 +271,8 @@ void stm32_power_init(void)
 	LL_AHB4_GRP1_EnableClock(LL_AHB4_GRP1_PERIPH_PWR);
 
 #ifdef CONFIG_DEBUG
-	LL_DBGMCU_EnableDBGStandbyMode();
 	LL_DBGMCU_APB7_GRP1_FreezePeriph(LL_DBGMCU_APB7_GRP1_RTC_STOP);
 	LL_DBGMCU_APB7_GRP1_FreezePeriph(LL_DBGMCU_APB7_GRP1_LPTIM1_STOP);
-#else
-	LL_DBGMCU_DisableDBGStandbyMode();
 #endif
 
 	/* Enable SRAM full retention */
