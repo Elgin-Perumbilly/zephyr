@@ -13,6 +13,8 @@
 #include <zephyr/dt-bindings/video/video-interfaces.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/pm/device.h>
+#include <zephyr/pm/device_runtime.h>
 #include <zephyr/video/video.h>
 
 #include "video_common.h"
@@ -386,26 +388,6 @@ static int imx335_get_caps(const struct device *dev, struct video_caps *caps)
 	return 0;
 }
 
-static int imx335_set_stream(const struct device *dev, bool enable, enum video_buf_type type)
-{
-	const struct imx335_config *cfg = dev->config;
-	struct imx335_data *drv_data = dev->data;
-	int ret;
-
-	ret = video_write_cci_reg(&cfg->i2c, IMX335_STANDBY,
-				  enable ? IMX335_STANDBY_OPERATING : IMX335_STANDBY_STANDBY);
-	if (ret < 0) {
-		LOG_ERR("Failed to set standby register\n");
-		return ret;
-	}
-
-	drv_data->enabled = enable;
-
-	k_sleep(K_USEC(20));
-
-	return 0;
-}
-
 static int imx335_set_ctrl_gain(const struct device *dev)
 {
 	const struct imx335_config *cfg = dev->config;
@@ -476,16 +458,34 @@ static int imx335_set_ctrl_test_pattern(const struct device *dev)
 
 static int imx335_set_ctrl(const struct device *dev, unsigned int cid)
 {
+	int ret;
+
+	/*
+	 * Ensure the sensor is powered before updating control registers.
+	 * Release the runtime PM reference after the update.
+	 */
+	ret = pm_device_runtime_get(dev);
+	if (ret < 0) {
+		return ret;
+	}
+
 	switch (cid) {
 	case VIDEO_CID_ANALOGUE_GAIN:
-		return imx335_set_ctrl_gain(dev);
+		ret = imx335_set_ctrl_gain(dev);
+		break;
 	case VIDEO_CID_EXPOSURE:
-		return imx335_set_ctrl_exposure(dev);
+		ret = imx335_set_ctrl_exposure(dev);
+		break;
 	case VIDEO_CID_TEST_PATTERN:
-		return imx335_set_ctrl_test_pattern(dev);
+		ret = imx335_set_ctrl_test_pattern(dev);
+		break;
 	default:
-		return -ENOTSUP;
+		ret = -ENOTSUP;
 	}
+
+	pm_device_runtime_put(dev);
+
+	return ret;
 }
 
 static int imx335_set_frmival(const struct device *dev, struct video_frmival *frmival)
@@ -550,7 +550,6 @@ static int imx335_set_frmival(const struct device *dev, struct video_frmival *fr
 static int imx335_set_fmt(const struct device *dev, struct video_format *fmt)
 {
 	struct imx335_data *drv_data = dev->data;
-	const struct imx335_config *cfg = dev->config;
 	struct imx335_ctrls *ctrls = &drv_data->ctrls;
 	int ret;
 	size_t fmt_idx;
@@ -567,18 +566,36 @@ static int imx335_set_fmt(const struct device *dev, struct video_format *fmt)
 	}
 
 	if (fmt_idx == IMX335_RES_2592x1944) {
-		/* Full resolution */
-
-		ret = video_write_cci_multiregs(&cfg->i2c, imx335_bin_none,
-						ARRAY_SIZE(imx335_bin_none));
-		if (ret < 0) {
-			LOG_ERR("Failed to disable binning");
-			return ret;
-		}
-
 		ctrls->exposure.range.max = IMX335_VMAX_DEFAULT - IMX335_SHR0_MIN;
 		ctrls->exposure.range.def = IMX335_VMAX_DEFAULT - IMX335_SHR0_MIN;
 	} else if (fmt_idx == IMX335_RES_1296x972) {
+		ctrls->exposure.range.max = IMX335_VMAX_DEFAULT - IMX335_SHR0_MIN_BINNING;
+		ctrls->exposure.range.def = IMX335_VMAX_DEFAULT - IMX335_SHR0_MIN_BINNING;
+
+		/* update exposure, since the upper limit is lower if binning is active */
+		ctrls->exposure.val = MIN(ctrls->exposure.range.max, ctrls->exposure.val);
+	}
+
+	drv_data->fmt.width = fmt->width;
+	drv_data->fmt.height = fmt->height;
+
+	return 0;
+}
+
+/*
+ * Program the binning and HMAX registers for the current format and
+ * frame rate. Since the sensor is reset during suspend, this must be
+ * done each time streaming starts after resume.
+ */
+static int imx335_apply_mode(const struct device *dev)
+{
+	const struct imx335_config *cfg = dev->config;
+	struct imx335_data *drv_data = dev->data;
+	bool binning = (drv_data->fmt.width == IMX335_BIN_2X2_WIDTH &&
+			drv_data->fmt.height == IMX335_BIN_2X2_HEIGHT);
+	int ret;
+
+	if (binning) {
 		/* 2x2 binning mode */
 
 		LOG_DBG("2x2 binning mode active");
@@ -589,20 +606,22 @@ static int imx335_set_fmt(const struct device *dev, struct video_format *fmt)
 			return ret;
 		}
 
-		ctrls->exposure.range.max = IMX335_VMAX_DEFAULT - IMX335_SHR0_MIN_BINNING;
-		ctrls->exposure.range.def = IMX335_VMAX_DEFAULT - IMX335_SHR0_MIN_BINNING;
-
-		/* update exposure, since the upper limit is lower if binning is active */
-		ctrls->exposure.val = MIN(ctrls->exposure.range.max, ctrls->exposure.val);
 		ret = imx335_set_ctrl_exposure(dev);
 		if (ret < 0) {
 			LOG_ERR("Failed to update exposure while enabling binning");
 			return ret;
 		}
+	} else {
+		/* Full resolution */
+
+		ret = video_write_cci_multiregs(&cfg->i2c, imx335_bin_none,
+						ARRAY_SIZE(imx335_bin_none));
+		if (ret < 0) {
+			LOG_ERR("Failed to disable binning");
+			return ret;
+		}
 	}
 
-	drv_data->fmt.width = fmt->width;
-	drv_data->fmt.height = fmt->height;
 	/* update framerate, since the timing and allowed framerates may have changed */
 	struct video_frmival frmival = {
 		.numerator = 1,
@@ -640,6 +659,55 @@ static int imx335_enum_frmival(const struct device *dev, struct video_frmival_en
 	fie->type = VIDEO_FRMIVAL_TYPE_DISCRETE;
 	fie->discrete.numerator = 1;
 	fie->discrete.denominator = imx335_framerates[fie->index];
+
+	return 0;
+}
+
+static int imx335_set_stream(const struct device *dev, bool enable, enum video_buf_type type)
+{
+	const struct imx335_config *cfg = dev->config;
+	struct imx335_data *drv_data = dev->data;
+	int ret;
+
+	if (enable) {
+		ret = pm_device_runtime_get(dev);
+		if (ret < 0) {
+			LOG_ERR("Failed to acquire PM runtime reference");
+			return ret;
+		}
+
+		/*
+		 * The sensor is powered down (and reset) while suspended, so the
+		 * mode registers must be (re)applied every time streaming starts.
+		 */
+		ret = imx335_apply_mode(dev);
+		if (ret < 0) {
+			pm_device_runtime_put(dev);
+			return ret;
+		}
+	}
+
+	ret = video_write_cci_reg(&cfg->i2c, IMX335_STANDBY,
+				  enable ? IMX335_STANDBY_OPERATING : IMX335_STANDBY_STANDBY);
+	if (ret < 0) {
+		LOG_ERR("Failed to set standby register\n");
+		if (enable) {
+			pm_device_runtime_put(dev);
+		}
+		return ret;
+	}
+
+	drv_data->enabled = enable;
+
+	k_sleep(K_USEC(20));
+
+	if (!enable) {
+		ret = pm_device_runtime_put(dev);
+		if (ret < 0) {
+			LOG_ERR("Failed to release PM runtime reference");
+			return ret;
+		}
+	}
 
 	return 0;
 }
@@ -746,25 +814,18 @@ static int imx335_init_controls(const struct device *dev)
 				   imx335_test_pattern_menu);
 }
 
-static int imx335_init(const struct device *dev)
+/*
+ * Initializes sensor hardware and restores it on resume.
+ * Mode-specific registers are configured by imx335_apply_mode()
+ * at stream start.
+ */
+static int imx335_configure(const struct device *dev)
 {
 	const struct imx335_config *cfg = dev->config;
-	struct imx335_data *drv_data = dev->data;
 	int ret;
-
-	if (!device_is_ready(cfg->i2c.bus)) {
-		LOG_ERR("Bus device is not ready");
-		return -ENODEV;
-	}
 
 #if DT_ANY_INST_HAS_PROP_STATUS_OKAY(reset_gpios)
 	if (cfg->reset_gpio.port != NULL) {
-		if (!gpio_is_ready_dt(&cfg->reset_gpio)) {
-			LOG_ERR("%s: device %s is not ready", dev->name,
-				cfg->reset_gpio.port->name);
-			return -ENODEV;
-		}
-
 		/* Power up sequence */
 		ret = gpio_pin_configure_dt(&cfg->reset_gpio, GPIO_OUTPUT_ACTIVE);
 		if (ret < 0) {
@@ -775,7 +836,7 @@ static int imx335_init(const struct device *dev)
 
 		gpio_pin_set_dt(&cfg->reset_gpio, 0);
 
-		k_sleep(K_USEC(600)); /* T4 */
+		k_sleep(K_USEC(601)); /* T4 */
 	}
 #endif
 
@@ -791,13 +852,7 @@ static int imx335_init(const struct device *dev)
 	ret = video_write_cci_multiregs16(&cfg->i2c, imx335_fixed_regs,
 					  ARRAY_SIZE(imx335_fixed_regs));
 	if (ret < 0) {
-		LOG_ERR("Unable to initialize the sensor");
-		return ret;
-	}
-
-	ret = imx335_set_fmt(dev, &drv_data->fmt);
-	if (ret < 0) {
-		LOG_ERR("Unable to apply format");
+		LOG_ERR("Unable to write fixed registers");
 		return ret;
 	}
 
@@ -805,17 +860,106 @@ static int imx335_init(const struct device *dev)
 	ret = video_write_cci_multiregs(&cfg->i2c, imx335_mode_2l_10b,
 					ARRAY_SIZE(imx335_mode_2l_10b));
 	if (ret < 0) {
-		LOG_ERR("Unable to initialize the sensor");
+		LOG_ERR("Unable to set lane mode");
 		return ret;
 	}
 
-	ret = imx335_set_input_clk(dev, cfg->input_clk);
+	return imx335_set_input_clk(dev, cfg->input_clk);
+}
+
+#ifdef CONFIG_PM_DEVICE
+static int imx335_pm_action(const struct device *dev, enum pm_device_action action)
+{
+	const struct imx335_config *cfg = dev->config;
+	struct imx335_data *drv_data = dev->data;
+	int ret;
+
+	switch (action) {
+	case PM_DEVICE_ACTION_RESUME: {
+		/* Save streaming state so it can be restored after sensor reinitialization.*/
+		bool was_streaming = drv_data->enabled;
+
+		ret = imx335_configure(dev);
+		if (ret < 0) {
+			return ret;
+		}
+
+		/* Resume frame output if streaming was active before suspend. */
+		if (was_streaming) {
+			ret = imx335_apply_mode(dev);
+			if (ret < 0) {
+				return ret;
+			}
+
+			ret = video_write_cci_reg(&cfg->i2c, IMX335_STANDBY,
+						  IMX335_STANDBY_OPERATING);
+			if (ret < 0) {
+				LOG_ERR("Failed to restore streaming after resume");
+				return ret;
+			}
+			k_sleep(K_USEC(20));
+			drv_data->enabled = true;
+		}
+
+		return 0;
+	}
+
+	case PM_DEVICE_ACTION_SUSPEND:
+#if DT_ANY_INST_HAS_PROP_STATUS_OKAY(reset_gpios)
+		if (cfg->reset_gpio.port != NULL) {
+			return gpio_pin_set_dt(&cfg->reset_gpio, 1);
+		}
+#endif
+		return video_write_cci_reg(&cfg->i2c, IMX335_STANDBY, IMX335_STANDBY_STANDBY);
+
+	default:
+		return -ENOTSUP;
+	}
+}
+#endif /* CONFIG_PM_DEVICE */
+
+static int imx335_init(const struct device *dev)
+{
+	const struct imx335_config *cfg = dev->config;
+	int ret;
+
+	if (!device_is_ready(cfg->i2c.bus)) {
+		LOG_ERR("Bus device is not ready");
+		return -ENODEV;
+	}
+
+#if DT_ANY_INST_HAS_PROP_STATUS_OKAY(reset_gpios)
+	if (cfg->reset_gpio.port != NULL) {
+		if (!gpio_is_ready_dt(&cfg->reset_gpio)) {
+			LOG_ERR("%s: device %s is not ready", dev->name,
+				cfg->reset_gpio.port->name);
+			return -ENODEV;
+		}
+	}
+#endif
+
+	/*
+	 * Always bring the sensor up during init, regardless of whether
+	 * CONFIG_PM_DEVICE is enabled, so the driver is usable without PM.
+	 */
+	ret = imx335_configure(dev);
 	if (ret < 0) {
-		LOG_ERR("Unable to configure INCK");
 		return ret;
 	}
 
-	return imx335_init_controls(dev);
+	ret = imx335_init_controls(dev);
+	if (ret < 0) {
+		return ret;
+	}
+
+#ifdef CONFIG_PM_DEVICE_RUNTIME
+	ret = pm_device_runtime_enable(dev);
+	if (ret < 0) {
+		LOG_ERR("Failed to enable PM runtime");
+		return ret;
+	}
+#endif
+	return 0;
 }
 
 #if DT_ANY_INST_HAS_PROP_STATUS_OKAY(reset_gpios)
@@ -840,7 +984,10 @@ static int imx335_init(const struct device *dev)
 		.input_clk = DT_INST_PROP_BY_PHANDLE(n, clocks, clock_frequency),		\
 	};											\
 												\
-	DEVICE_DT_INST_DEFINE(n, &imx335_init, NULL, &imx335_data_##n, &imx335_cfg_##n,		\
+	PM_DEVICE_DT_INST_DEFINE(n, imx335_pm_action);						\
+												\
+	DEVICE_DT_INST_DEFINE(n, &imx335_init, PM_DEVICE_DT_INST_GET(n),			\
+			      &imx335_data_##n, &imx335_cfg_##n,				\
 			      POST_KERNEL, CONFIG_VIDEO_INIT_PRIORITY, &imx335_driver_api);	\
 												\
 	VIDEO_DEVICE_DEFINE(imx335_##n, DEVICE_DT_INST_GET(n), NULL);
